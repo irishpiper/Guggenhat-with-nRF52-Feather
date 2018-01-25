@@ -1,0 +1,623 @@
+/*--------------------------------------------------------------------------
+ GUGGENHAT: a Bluefruit LE-enabled wearable NeoPixel marquee.
+ 
+ Requires:
+ - Arduino Micro or Leonardo microcontroller board.  An Arduino Uno will
+ NOT work -- Bluetooth plus the large NeoPixel array requires the extra
+ 512 bytes available on the Micro/Leonardo boards.
+ - Adafruit Bluefruit LE nRF8001 breakout: www.adafruit.com/products/1697
+ - 4 Meters 60 NeoPixel LED strip: www.adafruit.com/product/1461
+ - 3xAA alkaline cells, 4xAA NiMH or a beefy (e.g. 1200 mAh) LiPo battery.
+ - Late-model Android or iOS phone or tablet running nRF UART or
+ Bluefruit LE Connect app.
+ - BLE_UART, NeoPixel, NeoMatrix and GFX libraries for Arduino.
+ 
+ Written by Phil Burgess / Paint Your Dragon for Adafruit Industries.
+ MIT license.  All text above must be included in any redistribution.
+ 
+ Extended  by Eric F. Palmer
+ - added default message capability
+ - added a few eye candy affects that only display when the hat is started
+ - fixed a color setting defect that caused memory corrpution
+ - added a command to the bluetooth commands to redisplay the default messages
+ 
+ Desired Enhancements
+ - more eye candy
+ - ability to interrupt eye candy with a bluetooth sent message
+ - ability to get battery level via bluetooth, maybe even display it on the hat
+ 
+ --------------------------------------------------------------------------*/
+
+#include <SPI.h>
+//#include <Adafruit_BLE_UART.h> (removed for Feather)
+// add new include for feather bluefruit nRF52
+#include <bluefruit.h>
+#include <Adafruit_NeoPixel.h>
+#include <Adafruit_NeoMatrix.h>
+#include <Adafruit_GFX.h>
+
+//Not sure if this is where to add this (From bleuart code that works)
+// BLE Service
+// BLEDis  bledis;
+// BLEUart bleuart;
+// BLEBas  blebas;
+
+// NEOPIXEL STUFF ----------------------------------------------------------
+
+// 4 meters of NeoPixel strip is coiled around a top hat; the result is
+// not a perfect grid.  My large-ish 61cm circumference hat accommodates
+// 37 pixels around...a 240 pixel reel isn't quite enough for 7 rows all
+// around, so there's 7 rows at the front, 6 at the back; a smaller hat
+// will fare better.
+#define NEO_PIN     6 // Arduino pin to NeoPixel data input
+#define NEO_WIDTH  32 // Hat circumference in pixels
+#define NEO_HEIGHT  8 // Number of pixel rows (round up if not equal)
+#define NEO_OFFSET  (((NEO_WIDTH * NEO_HEIGHT) - 240) / 2)
+
+// Pixel strip must be coiled counterclockwise, top to bottom, due to
+// custom remap function (not a regular grid).
+Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(NEO_WIDTH, NEO_HEIGHT, NEO_PIN,  NEO_MATRIX_TOP + NEO_MATRIX_LEFT + NEO_MATRIX_COLUMNS + NEO_MATRIX_ZIGZAG, NEO_GRB + NEO_KHZ800);
+//Adafruit_NeoMatrix matrix(NEO_WIDTH, NEO_HEIGHT, NEO_PIN,
+//NEO_MATRIX_TOP  + NEO_MATRIX_LEFT +
+//NEO_MATRIX_ROWS + NEO_MATRIX_ZIGZAG,
+//NEO_GRB         + NEO_KHZ800);
+
+char          msg[21]       = {
+  0};            // BLE 20 char limit + NUL(CAN I CHANGE THIS DUE TO LARGER MESSAGE ON nRF52?)
+uint8_t       msgLen        = 0;              // Empty message
+int           msgX          = matrix.width(); // Start off right edge
+unsigned long prevFrameTime = 0L;             // For animation timing
+#define FPS 30                                // Scrolling speed
+
+// EFP Custom stuff  ----------------------------------------------------------------
+boolean displayEyeCandy = true; // only at the startup of the hat, can't send bluretooth lessage t
+boolean displayDefaultMsg = true;  
+boolean thisDefaultMsgAlreadyDisplayed = false;
+int currentDefaultMsg = 0;  // start at the first message
+unsigned long startDefaultMsgMs = 0;
+
+#define START_DELAY_MS 5000
+#define MSGCT 3
+uint8_t defaultMsgCt = MSGCT;     // set this to the count of default messages
+/* edit the array lengths to show the default message count */
+char *default_msgs[MSGCT];        // the default messages in an array, must be 20 character long or less
+uint8_t msg_len[MSGCT];           // array of default message lengths
+char *msg_color[MSGCT];           // array of msg colors, each default message can have a different color
+unsigned long msg_ms[MSGCT];      // the length of time in MS to display each message, hand tweak this.
+
+// this is where you set your default messages
+void setUpDefaultMsg() {
+  /*default_msgs[0] = "TTTT"; //17
+  default_msgs[1] = "0000"; //16
+  default_msgs[2] = "HELLO"; //14
+  default_msgs[3] = "RVA MAKERFEST"; //13 
+  default_msgs[4] = "SCIENCE MATTERS"; //15 
+  msg_len[0] = 4;
+  msg_len[1] = 11;
+  msg_len[2] = 14;
+  msg_len[3] = 14;
+  msg_len[4] = 15; 
+  msg_color[0] = "#FFFFFF";
+  msg_color[1] = "#0000FF";
+  msg_color[2] = "#FFFF00";
+  msg_color[3] = "#00FF00";
+  msg_color[4] = "#FFFFFF";  
+  msg_ms[0] = 3000;
+  msg_ms[1] = 5000;
+  msg_ms[2] = 6000;
+  msg_ms[3] = 5500;
+  msg_ms[4] = 6200; */
+  
+  default_msgs[0] = "ROBO RANGERS"; //19
+  default_msgs[1] = "TEAM 10035"; //19
+  default_msgs[2] = "GO THERESA"; //19 
+  msg_len[0] = 19;
+  msg_len[1] = 19;
+  msg_len[2] = 19; 
+  msg_color[0] = "#00FF00";
+  msg_color[1] = "#0000FF";
+  msg_color[2] = "#00FF00";  
+  msg_ms[0] = 5000;
+  msg_ms[1] = 5000;
+  msg_ms[2] = 5000; 
+  
+}
+
+// BLUEFRUIT LE STUFF-------------------------------------------------------
+// Modified to Bluefruit Feather Uart code 
+// THIS COULD BE WHERE THE BLE SERVICE PORTIONS SHOULD GO... are those definitions????
+
+// CLK, MISO, MOSI connect to hardware SPI.  Other pins are configrable: OLD FOR SEPARATE BLE DEVICE
+// #define ADAFRUITBLE_REQ 10
+// #define ADAFRUITBLE_RST  9
+// define ADAFRUITBLE_RDY  2 // Must be an interrupt pin
+
+//Adafruit_BLE_UART BTLEserial = Adafruit_BLE_UART(
+// ADAFRUITBLE_REQ, ADAFRUITBLE_RDY, ADAFRUITBLE_RST);
+// aci_evt_opcode_t  prevState  = ACI_EVT_DISCONNECTED;
+
+// BLE Service - ADDED FOR nRF52
+BLEDis  bledis;
+BLEUart bleuart;
+BLEBas  blebas;
+
+// Software Timer for blinking RED LED  **** Added from nRF52
+SoftwareTimer blinkTimer;
+
+// STATUS LED STUFF --------------------------------------------------------
+
+// The Arduino's onboard LED indicates BTLE status.  Fast flash = waiting
+// for connection, slow flash = connected, off = disconnected.
+// #define LED 13                   // Onboard LED (not NeoPixel) pin
+// int           LEDperiod   = 0;   // Time (milliseconds) between LED toggles
+// boolean       LEDstate    = LOW; // LED flashing state HIGH/LOW
+// unsigned long prevLEDtime = 0L;  // For LED timing
+
+// Need to check for these variables in the remainder of the code - but add nRF52 LED code below
+
+
+// UTILITY FUNCTIONS -------------------------------------------------------
+
+// Because the NeoPixel strip is coiled and not a uniform grid, a special
+// remapping function is used for the NeoMatrix library.  Given an X and Y
+// grid position, this returns the corresponding strip pixel number.
+// Any off-strip pixels are automatically clipped by the NeoPixel library.
+uint16_t remapXY(uint16_t x, uint16_t y) {
+  return y * NEO_WIDTH + x - NEO_OFFSET;
+}
+
+// Given hexadecimal character [0-9,a-f], return decimal value (0 if invalid)
+uint8_t unhex(char c) {
+  return ((c >= '0') && (c <= '9')) ?      c - '0' :
+  ((c >= 'a') && (c <= 'f')) ? 10 + c - 'a' :
+  ((c >= 'A') && (c <= 'F')) ? 10 + c - 'A' : 0;
+}
+
+// Read from BTLE into buffer, up to maxlen chars (remainder discarded).
+// Does NOT append trailing NUL.  Returns number of bytes stored.
+uint8_t readStr(char dest[], uint8_t maxlen) {
+  int     c;
+  uint8_t len = 0;
+//  while((c = BTLEserial.read()) >= 0) {
+    while((c = Serial.read()) >= 0) {
+    if(len < maxlen) dest[len++] = c;
+  }
+  return len;
+}
+// -------------------------------------------------------------
+// EFP custom functions   eye Candy and supporting functions 
+// -------------------------------------------------------------
+void displayGraphics_1(unsigned long delayMs){
+  unsigned int ctRow = 0;
+
+  matrix.fillScreen(0);
+  while (ctRow < NEO_HEIGHT ){
+    matrix.drawPixel(18, ctRow, matrix.Color(255, 0, 0)),
+    ++ctRow;
+  }
+  matrix.show();
+  delay(delayMs);
+  matrix.fillScreen(0);
+  ctRow = 0;
+  while (ctRow < NEO_HEIGHT ){
+    matrix.drawPixel(19, ctRow, matrix.Color(0, 0, 255));
+    matrix.drawPixel(17, ctRow, matrix.Color(0, 0, 255));
+    ++ctRow;
+  }
+  matrix.show();
+  delay(delayMs);
+
+}
+
+void displayColsAround(unsigned long delayMs){
+  for (unsigned int col=0; col < NEO_WIDTH; ++col){
+    matrix.fillScreen(0);
+    pixelCol(col, 0, 7, 255, 255, 0);
+    matrix.show();
+    delay(delayMs);
+  }
+}
+
+void displayColsAround_2(unsigned long delayMs){
+  for (unsigned int col=0; col < NEO_WIDTH; ++col){
+    matrix.fillScreen(0);
+    pixelCol(col, 0, 7, 255, 255, 0);
+    pixelCol(NEO_WIDTH - col, 0, 7, 0, 0, 255);
+    matrix.show();
+    delay(delayMs);
+  }
+}
+
+void pixelCol(unsigned int col, unsigned int startRow, unsigned int endRow, byte red, byte green, byte blue){
+  for (unsigned int r = startRow; r <= endRow; ++r){
+    matrix.drawPixel(col, r, matrix.Color(red, green, blue));
+  }
+}
+
+void displayRowsAround(unsigned long delayMs){
+  for (unsigned int row=0; row < NEO_HEIGHT; ++row){
+    matrix.fillScreen(0);
+    pixelRow(row, 0, NEO_WIDTH-1, 255, 0, 0);
+    matrix.show();
+    delay(delayMs);
+  }
+}
+
+void pixelRow(unsigned int row, unsigned int startCol, unsigned int endCol, byte red, byte green, byte blue){
+  for (unsigned int col = startCol; col <= endCol; ++col){
+    matrix.drawPixel(col, row, matrix.Color(red, green, blue));
+  }  
+}
+
+// Trying definitions here nRF52
+  void connect_callback(uint16_t conn_handle)
+{
+  char central_name[32] = { 0 };
+  Bluefruit.Gap.getPeerName(conn_handle, central_name, sizeof(central_name));
+
+  Serial.print("Connected to ");
+  Serial.println(central_name);
+}
+
+void disconnect_callback(uint16_t conn_handle, uint8_t reason)
+{
+  (void) conn_handle;
+  (void) reason;
+
+  Serial.println();
+  Serial.println("Disconnected");
+}
+
+/**
+ * Software Timer callback is invoked via a built-in FreeRTOS thread with
+ * minimal stack size. Therefore it should be as simple as possible. If
+ * a periodically heavy task is needed, please use Scheduler.startLoop() to
+ * create a dedicated task for it.
+ * 
+ * More information http://www.freertos.org/RTOS-software-timer.html
+ */
+void blink_timer_callback(TimerHandle_t xTimerID)
+{
+  (void) xTimerID;
+  digitalToggle(LED_RED);
+}
+
+/**
+ * RTOS Idle callback is automatically invoked by FreeRTOS
+ * when there are no active threads. E.g when loop() calls delay() and
+ * there is no bluetooth or hw event. This is the ideal place to handle
+ * background data.
+ * 
+ * NOTE: FreeRTOS is configured as tickless idle mode. After this callback
+ * is executed, if there is time, freeRTOS kernel will go into low power mode.
+ * Therefore waitForEvent() should not be called in this callback.
+ * http://www.freertos.org/low-power-tickless-rtos.html
+ * 
+ * WARNING: This function MUST NOT call any blocking FreeRTOS API 
+ * such as delay(), xSemaphoreTake() etc ... for more information
+ * http://www.freertos.org/a00016.html
+ */
+void rtos_idle_callback(void)
+{
+  // Don't call any other FreeRTOS blocking API()
+  // Perform background task(s) here
+}
+
+// Moved nRF52 from below
+void startAdv(void)
+{
+  // Advertising packet
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addTxPower();
+
+  // Include bleuart 128-bit uuid
+  Bluefruit.Advertising.addService(bleuart);
+
+  // Secondary Scan Response packet (optional)
+  // Since there is no room for 'Name' in Advertising packet
+  Bluefruit.ScanResponse.addName();
+  
+  /* Start Advertising
+   * - Enable auto advertising if disconnected
+   * - Interval:  fast mode = 20 ms, slow mode = 152.5 ms
+   * - Timeout for fast mode is 30 seconds
+   * - Start(timeout) with timeout = 0 will advertise forever (until connected)
+   * 
+   * For recommended advertising interval
+   * https://developer.apple.com/library/content/qa/qa1931/_index.html   
+   */
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.setInterval(32, 244);    // in unit of 0.625 ms
+  Bluefruit.Advertising.setFastTimeout(30);      // number of seconds in fast mode
+  Bluefruit.Advertising.start(0);                // 0 = Don't stop advertising after n seconds  
+// *************************************************************
+}
+
+// -------------------------------------------------------------
+// MEAT, POTATOES ----------------------------------------------
+// -------------------------------------------------------------
+void setup() {
+  matrix.begin();
+//    matrix.setRemapFunction(remapXY);
+  matrix.setTextWrap(false);   // Allow scrolling off left
+  matrix.setTextColor(matrix.Color(255, 0, 0)); // Red by default
+  matrix.setBrightness(31);    // Batteries have limited sauce
+
+ // BTLEserial.begin(); / replaced with bluefruit setup below above loop nRF52
+
+//For now removing these lines - but could change pin to 17 above and keep in (adding back lines)
+//  pinMode(LED, OUTPUT);
+//  digitalWrite(LED, LOW);
+
+  // EFP
+  setUpDefaultMsg();
+
+  delay(START_DELAY_MS);
+
+//************************************************************
+// Sections from nRF52 bleuart - not sure how to assign variable neccesary from serial 
+ Serial.begin(115200);
+  Serial.println("Bluefruit52 BLEUART Example");
+  Serial.println("---------------------------\n");
+
+  // Initialize blinkTimer for 1000 ms and start 
+// CONFUSED HERE - blinkTimer is works in original Uart code 
+ blinkTimer.begin(1000, blink_timer_callback);
+ blinkTimer.start();
+
+  // Setup the BLE LED to be enabled on CONNECT
+  // Note: This is actually the default behaviour, but provided
+  // here in case you want to control this LED manually via PIN 19
+  Bluefruit.autoConnLed(true);
+
+  // Config the peripheral connection with maximum bandwidth 
+  // more SRAM required by SoftDevice
+  // Note: All config***() function must be called before begin()
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
+
+  //ADD Definitions for UART here???? nRF52 Maybe I need to move them out of setup???? 
+//  void connect_callback(uint16_t conn_handle)
+//  ...
+// void rtos_idle_callback(void)
+
+
+  Bluefruit.begin();
+  // Set max power. Accepted values are: -40, -30, -20, -16, -12, -8, -4, 0, 4
+  Bluefruit.setTxPower(4);
+  Bluefruit.setName("Bluefruit52");
+  //Bluefruit.setName(getMcuUniqueID()); // useful testing with multiple central connections
+  // RECEIVING A COMPILING ERROR HERE re connect callback not declared in this scope - is it necessary????
+  Bluefruit.setConnectCallback(connect_callback);
+  Bluefruit.setDisconnectCallback(disconnect_callback);
+
+  // Configure and Start Device Information Service
+  bledis.setManufacturer("Adafruit Industries");
+  bledis.setModel("Bluefruit Feather52");
+  bledis.begin();
+
+  // Configure and Start BLE Uart Service
+  bleuart.begin();
+
+  // Start BLE Battery Service
+  blebas.begin();
+  blebas.write(100);
+
+  // Set up and start advertising
+  startAdv();
+
+  Serial.println("Please use Adafruit's Bluefruit LE app to connect in UART mode");
+  Serial.println("Once connected, enter character(s) that you wish to send");
+}
+
+// Maybe move to definitions prior to setup??
+//void startAdv(void)
+// {
+  // Advertising packet
+//  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+//  Bluefruit.Advertising.addTxPower();
+
+  // Include bleuart 128-bit uuid
+//  Bluefruit.Advertising.addService(bleuart);
+
+  // Secondary Scan Response packet (optional)
+  // Since there is no room for 'Name' in Advertising packet
+//  Bluefruit.ScanResponse.addName();
+  
+  /* Start Advertising
+   * - Enable auto advertising if disconnected
+   * - Interval:  fast mode = 20 ms, slow mode = 152.5 ms
+   * - Timeout for fast mode is 30 seconds
+   * - Start(timeout) with timeout = 0 will advertise forever (until connected)
+   * 
+   * For recommended advertising interval
+   * https://developer.apple.com/library/content/qa/qa1931/_index.html   
+   */
+//  Bluefruit.Advertising.restartOnDisconnect(true);
+//  Bluefruit.Advertising.setInterval(32, 244);    // in unit of 0.625 ms
+//  Bluefruit.Advertising.setFastTimeout(30);      // number of seconds in fast mode
+//  Bluefruit.Advertising.start(0);                // 0 = Don't stop advertising after n seconds  
+// *************************************************************
+// }
+
+void loop() {
+// Added since can't seem to connect - more may need to be moved from setup to within loop
+  // Configure and Start BLE Uart Service
+  bleuart.begin();
+
+  // Start BLE Battery Service
+  blebas.begin();
+  blebas.write(100);
+
+  // Set up and start advertising
+  startAdv();
+  
+  unsigned long t = millis(); // Current elapsed time, milliseconds.
+  // millis() comparisons are used rather than delay() so that animation
+  // speed is consistent regardless of message length & other factors.
+
+// THIS ALL APPEARS OLD AND COVERED BY THE while section of nRF52
+//  BTLEserial.pollACI(); // Handle BTLE operations
+//  aci_evt_opcode_t state = BTLEserial.getState();
+
+//  if(state != prevState) { // BTLE state change?
+//    switch(state) {        // Change LED flashing to show state
+//    case ACI_EVT_DEVICE_STARTED: 
+//      LEDperiod = 1000L / 10; 
+//      break;
+//    case ACI_EVT_CONNECTED:      
+//      LEDperiod = 1000L / 2;  
+//      break;
+//    case ACI_EVT_DISCONNECTED:   
+//      LEDperiod = 0L;         
+//      break;
+//    }
+//   prevState   = state;
+//    prevLEDtime = t;
+//    LEDstate    = LOW; // Any state change resets LED
+//    digitalWrite(LED, LEDstate);
+//  }
+
+//  if(LEDperiod && ((t - prevLEDtime) >= LEDperiod)) { // Handle LED flash
+//    prevLEDtime = t;
+//    LEDstate    = !LEDstate;
+//    digitalWrite(LED, LEDstate);
+//  }
+
+// ************** nRF52 connection????? - NO NEEDS MOVED OUT OF LOOP AND INTO SETUP
+
+// ********** In the Uart code this followed the pull not proceeeded it.  But it seems to logically fit here
+
+  // If connected, check for input from BTLE... OLD CODE
+// **************************
+// This appears to utilize peek at the serial value  
+//  The Uart code writes serial to Uart and Uart to Serial - probably only need one - but will try both to start
+// Start new code ********
+
+// Forward data from HW Serial to BLEUART
+  while (Serial.available())
+  {
+    // Delay to wait for enough input, since we have a limited transmission buffer
+    delay(2);
+
+    uint8_t buf[64];
+    int count = Serial.readBytes(buf, sizeof(buf));
+    bleuart.write( buf, count );
+  }
+
+  // Forward from BLEUART to HW Serial
+  while ( bleuart.available() )
+  {
+    uint8_t ch;
+    ch = (uint8_t) bleuart.read();
+    Serial.write(ch);
+  }
+
+  // Request CPU to enter low-power mode until an event/interrupt occurs
+  waitForEvent();
+
+// END NEW CODE ****************
+
+  
+ // if((state == ACI_EVT_CONNECTED) && BTLEserial.available()) {
+ // I have to replace this line - not sure about the connected term - can do available
+    if(Serial.available()) {
+    int peekChar;
+ //   peekChar = BTLEserial.peek();
+      peekChar = Serial.peek();
+    if(peekChar == '#') { // Color commands start with '#'
+      char color[7];
+      switch(readStr(color, sizeof(color))) {
+      case 4:                  // #RGB    4/4/4 RGB
+        matrix.setTextColor(matrix.Color(
+        unhex(color[1]) * 17, // Expand to 8/8/8
+        unhex(color[2]) * 17,
+        unhex(color[3]) * 17));
+        break;
+      case 5:                  // #XXXX   5/6/5 RGB
+        matrix.setTextColor(
+        (unhex(color[1]) << 12) +
+          (unhex(color[2]) <<  8) +
+          (unhex(color[3]) <<  4) +
+          unhex(color[4]));
+        break;
+      case 7:                  // #RRGGBB 8/8/8 RGB
+        matrix.setTextColor(matrix.Color(
+        (unhex(color[1]) << 4) + unhex(color[2]),
+        (unhex(color[3]) << 4) + unhex(color[4]),
+        (unhex(color[5]) << 4) + unhex(color[6])));
+        break;
+      }
+    } 
+    else if (peekChar == ':'){
+      char colon[1];
+      // clear the str in bluetooth , is this necessary?
+      readStr(colon, 1);
+      displayDefaultMsg = true;
+      thisDefaultMsgAlreadyDisplayed = false; 
+      currentDefaultMsg = 0; 
+    }
+    else { // Not color, must be message string
+      displayDefaultMsg = false;
+      thisDefaultMsgAlreadyDisplayed = false;  
+      msgLen      = readStr(msg, sizeof(msg)-1);
+      msg[msgLen] = 0;
+      msgX        = matrix.width(); // Reset scrolling
+    }
+  }
+
+  if (displayEyeCandy == true) { 
+    // Eye Candy at start of default messages
+    // curently limited, bluetooth commands can't be captured when eye candy is displayed    
+    for (int i=0; i<3; ++i) {
+      displayRowsAround(30);
+    }
+
+    for (int i=0; i<3; ++i) {
+      displayColsAround_2(30);
+    }
+
+    for (int i=0; i<5; ++i) {
+      displayGraphics_1(80);
+    } 
+   
+   displayEyeCandy = false; 
+  }
+
+  if (displayDefaultMsg == true) {
+    if (thisDefaultMsgAlreadyDisplayed == false){
+      startDefaultMsgMs = millis();
+      char *color = msg_color[currentDefaultMsg];
+      matrix.setTextColor(matrix.Color(
+      (unhex(color[1]) << 4) + unhex(color[2]),
+      (unhex(color[3]) << 4) + unhex(color[4]),
+      (unhex(color[5]) << 4) + unhex(color[6])));
+
+      strncpy(msg, default_msgs[currentDefaultMsg], msg_len[currentDefaultMsg]);
+      msgLen      = msg_len[currentDefaultMsg];
+      msg[msgLen] = 0;
+      msgX        = matrix.width(); // Reset scrolling 
+
+      thisDefaultMsgAlreadyDisplayed = true; 
+    } 
+    else {
+      // time to move to the next default message?
+      if ((millis() - startDefaultMsgMs) > msg_ms[currentDefaultMsg]) {
+        ++currentDefaultMsg;
+        thisDefaultMsgAlreadyDisplayed = false;
+        if (currentDefaultMsg>(defaultMsgCt-1)){
+          currentDefaultMsg = 0;
+        }
+      }
+    } 
+  }
+
+
+  if((t - prevFrameTime) >= (1000L / FPS)) { // Handle scrolling
+    matrix.fillScreen(0);
+    matrix.setCursor(msgX, 0);
+    matrix.print(msg);
+    if(--msgX < (msgLen * -6)) msgX = matrix.width(); // We must repeat!
+    matrix.show();
+    prevFrameTime = t;
+  }
+}
